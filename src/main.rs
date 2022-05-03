@@ -1,10 +1,13 @@
 use crate::ErrorKind::{CannotRead, NotAnElf, NotDynamic, StrtableBad};
 use clap::Parser;
 use goblin::elf::dynamic::{DT_STRSZ, DT_STRTAB};
+use goblin::elf32::header::machine_to_str;
 use goblin::strtab::Strtab;
 use indicatif::ProgressIterator;
 use itertools::Itertools;
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -25,7 +28,7 @@ enum ErrorKind {
     StrtableBad(goblin::error::Error),
 }
 
-fn process_one(path: &Path) -> Result<Vec<String>, ErrorKind> {
+fn process_one(path: &Path) -> Result<(u16, Vec<String>), ErrorKind> {
     let file = std::fs::read(&path).map_err(CannotRead)?;
     let elf = goblin::elf::Elf::parse(&file).map_err(NotAnElf)?;
     let dynamic = elf.dynamic.ok_or(NotDynamic)?;
@@ -45,11 +48,14 @@ fn process_one(path: &Path) -> Result<Vec<String>, ErrorKind> {
     let table = Strtab::parse(&file, dyn_strtable as usize, dyn_strtable_size as usize, 0)
         .map_err(StrtableBad)?;
 
-    Ok(dynamic
-        .get_libraries(&table)
-        .into_iter()
-        .map(|l| l.to_string())
-        .collect())
+    Ok((
+        elf.header.e_machine,
+        dynamic
+            .get_libraries(&table)
+            .into_iter()
+            .map(|l| l.to_string())
+            .collect(),
+    ))
 }
 
 fn main() {
@@ -72,24 +78,32 @@ fn main() {
         .map(|f| f.path().to_path_buf())
     {
         let res = process_one(&f);
-        // println!("{:50}: {:?}", format!("{:?}", &f), res);
-        if let Ok(res) = res {
+        if let Ok((machine, res)) = res {
             for lib in res {
+                let mentry = aboba.entry(machine);
+                let aboba = mentry.or_insert(BTreeMap::new());
+
                 let entry = aboba.entry(lib);
                 entry.or_insert(Vec::new()).push(f.clone());
             }
         };
     }
 
-    for (soname, mut exes) in aboba
-        .into_iter()
-        .sorted_by_key(|(_, exes)| exes.len() as isize)
-        .rev()
-    {
-        println!("{} ({} exes)", soname, exes.len());
-        exes.sort();
-        for exe in exes {
-            println!("        <= {}", exe.to_str().unwrap());
+    for (machine, aboba) in aboba {
+        let machine = machine_to_str(machine);
+
+        let mut output = File::create(format!("m_{}.txt", machine)).unwrap();
+
+        for (soname, mut exes) in aboba
+            .into_iter()
+            .sorted_by_key(|(_, exes)| exes.len() as isize)
+            .rev()
+        {
+            writeln!(output, "{} ({} exes)", soname, exes.len()).unwrap();
+            exes.sort();
+            for exe in exes {
+                writeln!(output, "        <= {}", exe.to_str().unwrap()).unwrap();
+            }
         }
     }
 }
